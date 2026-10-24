@@ -105,14 +105,16 @@ def run_ping():
     HTTPServer(("0.0.0.0", port), Ping).serve_forever()
 
 
-def main():
+async def main():
     threading.Thread(target=run_ping, daemon=True).start()
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("stop", stop))
-    app.run_polling()
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling()
+    await asyncio.Event().wait()
 
 
 if __name__ == "__main__":
-    main()
-
+    asyncio.run(main())
