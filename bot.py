@@ -1,362 +1,460 @@
 import os
 import random
 import string
-import threading
 import asyncio
+import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-import httpx
 from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ContextTypes,
+)
+from psnawp_api import PSNAWP
 
-TOKEN = os.environ["BOT_TOKEN"]
+
+# =========================================================
+# إعدادات Render
+# =========================================================
+
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
+NPSSO = os.environ.get("NPSSO", "").strip()
+
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN غير موجود في Environment")
 
 UA = (
     "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
-    "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
+    "AppleWebKit/605.1.15 (KHTML, like Gecko) "
+    "Version/17.0 Mobile/15E148 Safari/604.1"
 )
 
 LETTERS = string.ascii_lowercase
 DIGITS = string.digits
+SYMBOLS = "_-"
 
-# وقت انتهاء الانتظار لكل برنامج (لما البرنامج يقول "استنى شوي")
-RATE = {}
+# ملاحظة: البحث عن الحساب لا يؤكد إمكانية حجز الاسم.
+CHECK_INTERVAL = 3.5
+MAX_ERRORS = 5
 
-# سوني ما تقبل يوزر يبدأ بـ _ أو - ، لو تبي تجربه غيّرها إلى True
-PSN_ALLOW_SYMBOL_FIRST = False
+# =========================================================
+# حالة PlayStation
+# =========================================================
 
-# ---------------------------------------------------------------
-# كل دالة ترجع: True = متاح ، False = غير متاح ، None = ما قدرت أتحقق
-# هذي نفس طلبات "فحص التوفر" اللي يستخدمها البرنامج وقت التسجيل،
-# فاليوزر المحظور أو المحجوز أو غير المقبول يطلع غير متاح.
-# ---------------------------------------------------------------
-
-
-def _retry_after(r, default=3.0):
-    try:
-        return float(r.json().get("retry_after", default))
-    except Exception:
-        pass
-    try:
-        return float(r.headers.get("Retry-After", default))
-    except Exception:
-        return default
-
-
-NPSSO = os.environ.get("NPSSO", "").strip()
 _psn = None
 _psn_lock = threading.Lock()
-PSN_STATE = {"auth_error": None, "last_error": None}
+
+PSN_STATE = {
+    "auth_error": None,
+    "last_error": None,
+    "last_check": None,
+}
 
 
-def _get_psn():
+def get_psn():
     global _psn
+
+    if not NPSSO:
+        raise RuntimeError(
+            "NPSSO غير موجود في Environment"
+        )
+
     if _psn is None:
-        from psnawp_api import PSNAWP
         _psn = PSNAWP(NPSSO)
+
     return _psn
 
 
-def _psn_lookup(name):
-    """يدور على اليوزر من حسابك. True = ما له صاحب (متاح) ، False = موجود ، None = ما قدر"""
-    if not NPSSO:
-        PSN_STATE["auth_error"] = "NPSSO ما انحط في Render"
-        return None
+def lookup_psn(name):
+    """
+    النتائج:
+      True  = الاسم غير موجود في بحث الحسابات.
+      False = الحساب موجود.
+      None  = تعذر التحقق.
+
+    True لا تعني أن الاسم قابل للحجز.
+    """
+
     with _psn_lock:
         try:
-            psn = _get_psn()
-        except Exception as e:
-            PSN_STATE["auth_error"] = type(e).__name__
-            return None
-        try:
+            psn = get_psn()
             psn.user(online_id=name)
+
             PSN_STATE["auth_error"] = None
+            PSN_STATE["last_error"] = None
+            PSN_STATE["last_check"] = time.time()
+
             return False
-        except Exception as e:
-            kind = type(e).__name__
-            if "NotFound" in kind:
+
+        except Exception as exc:
+            error_type = type(exc).__name__
+
+            PSN_STATE["last_error"] = error_type
+            PSN_STATE["last_check"] = time.time()
+
+            if (
+                error_type == "PSNAWPNotFoundError"
+            ):
                 PSN_STATE["auth_error"] = None
                 return True
-            if "Authentication" in kind or "Unauthorized" in kind:
-                PSN_STATE["auth_error"] = kind
-            PSN_STATE["last_error"] = kind
+
+            if (
+                "Authentication" in error_type
+                or "Unauthorized" in error_type
+            ):
+                PSN_STATE["auth_error"] = error_type
+
+            # لا نعتبر أي خطأ آخر دليل توفر.
             return None
 
 
-async def check_psn(client, name):
-    # مكتبة سوني بطيئة وتنتظر بين كل طلب (طلب كل 3 ثواني)، فنشغلها في خيط جانبي
-    return await asyncio.to_thread(_psn_lookup, name)
+async def check_psn(name):
+    return await asyncio.to_thread(
+        lookup_psn,
+        name,
+    )
 
 
-# اسم البرنامج: (دالة الفحص، عدد الفحوصات المتزامنة)
-SERVICES = {
-    "PlayStation": (check_psn, 3),
-}
+# =========================================================
+# توليد الأسماء
+# =========================================================
 
-# يوزر معروف إنه محجوز، نستخدمه نختبر فيه الفحص
-CANARY_TAKEN = {
-    "PlayStation": "john",
-}
+def random_name():
+    """
+    يولد أسماء من 4 أو 5 خانات،
+    تحتوي على _ أو - مرة واحدة.
 
-PAUSE_AFTER_FAILS = 30
-PAUSE_SECONDS = 30
+    هذه الأسماء مرشحة للبحث فقط،
+    وليست مضمونة القبول لدى PlayStation.
+    """
 
+    length = random.choice((4, 5))
+    symbol_position = random.randrange(1, length)
 
-def free_name():
-    """يوزر طويل عشوائي، أكيد غير موجود"""
-    mid = "".join(random.choice(LETTERS) for _ in range(13))
-    return random.choice(LETTERS) + mid + random.choice(LETTERS)
+    result = []
 
+    for position in range(length):
+        if position == symbol_position:
+            result.append(random.choice(SYMBOLS))
 
-def random_name(svc=None):
-    """4 أو 5 خانات فيها رمز واحد (_ أو -) في أي مكان، والباقي حروف وأرقام"""
-    length = random.choice([4, 5])
-    first_pos = 0 if PSN_ALLOW_SYMBOL_FIRST else 1
-    pos = random.randrange(first_pos, length)
-    symbol = random.choice("_-")
-    chars = []
-    for i in range(length):
-        if i == pos:
-            chars.append(symbol)
-        elif i == 0:
-            chars.append(random.choice(LETTERS))
+        elif position == 0:
+            result.append(random.choice(LETTERS))
+
         else:
-            chars.append(random.choice(LETTERS + DIGITS))
-    return "".join(chars)
+            result.append(
+                random.choice(LETTERS + DIGITS)
+            )
+
+    return "".join(result)
 
 
-async def conclusive(client, svc, name, tries=6):
-    """يكرر الفحص لين يجي جواب واضح (ينتظر لو البرنامج قال استنى)"""
-    checker = SERVICES[svc][0]
-    for _ in range(tries):
-        wait = RATE.get(svc, 0) - time.time()
-        if wait > 0:
-            await asyncio.sleep(wait)
-        res = await checker(client, name)
-        if res is not None:
-            return res
-        await asyncio.sleep(0.3)
-    return None
+def random_control_name():
+    """اسم عشوائي طويل لاستخدامه في اختبار البحث."""
+
+    return (
+        random.choice(LETTERS)
+        + "".join(
+            random.choice(LETTERS + DIGITS)
+            for _ in range(17)
+        )
+    )
 
 
-async def run_health(client, svc):
-    """
-    يتأكد إن الفحص سليم: المحجوز يطلع محجوز، والحر يطلع حر.
-    True = سليم ، False = غلط أكيد ، None = ما قدر يتأكد (حظر مؤقت مثلاً)
-    """
-    taken_res = await conclusive(client, svc, CANARY_TAKEN[svc], tries=3)
-    if PSN_STATE["auth_error"]:
-        return False
-    free_res = await conclusive(client, svc, free_name(), tries=3)
-    if taken_res is None or free_res is None:
-        return None
-    return taken_res is False and free_res is True
+# =========================================================
+# إدارة جلسات البحث
+# =========================================================
+
+sessions = {}
 
 
 class Session:
     def __init__(self):
         self.started = time.time()
-        self.queue = asyncio.Queue()
-        self.seen = {s: set() for s in SERVICES}
+        self.task = None
+        self.seen = set()
+        self.running = True
+
         self.stats = {
-            s: {
-                "checked": 0, "found": 0, "unknown": 0, "rejected": 0,
-                "streak": 0, "pause_until": 0.0, "ok": None,
-            }
-            for s in SERVICES
+            "checked": 0,
+            "not_found": 0,
+            "existing": 0,
+            "errors": 0,
         }
 
-    def next_name(self, svc):
-        seen = self.seen[svc]
-        if len(seen) > 300000:
-            seen.clear()
-        for _ in range(30):
-            n = random_name(svc)
-            if n not in seen:
-                seen.add(n)
-                return n
+    def next_name(self):
+        for _ in range(100):
+            name = random_name()
+
+            if name not in self.seen:
+                self.seen.add(name)
+                return name
+
         return None
 
 
-async def health_loop(sess, svc, client):
-    st = sess.stats[svc]
-    while True:
-        ok = await run_health(client, svc)
-        if ok is not None:          # لو ما قدر يتأكد نخلي الحالة السابقة
-            st["ok"] = ok
-        await asyncio.sleep(300 if st["ok"] else 60)
+# =========================================================
+# البحث
+# =========================================================
 
+async def search_loop(sess, bot, chat_id):
+    consecutive_errors = 0
 
-async def worker(sess, svc, client):
-    checker, _ = SERVICES[svc]
-    st = sess.stats[svc]
-    while True:
-        now = time.time()
-        if st["pause_until"] > now:
-            await asyncio.sleep(min(2, st["pause_until"] - now))
-            continue
-        wait = RATE.get(svc, 0) - now
-        if wait > 0:
-            await asyncio.sleep(min(2, wait))
-            continue
-        if st["ok"] is False:
-            # الفحص غير سليم، نرتاح ونتأكد كل شوي من health_loop
-            await asyncio.sleep(1)
-            continue
+    try:
+        while sess.running:
 
-        name = sess.next_name(svc)
-        if name is None:
-            await asyncio.sleep(0.05)
-            continue
+            name = sess.next_name()
 
-        res = await checker(client, name)
-
-        if res is None:
-            if RATE.get(svc, 0) > time.time():
-                sess.seen[svc].discard(name)   # البرنامج قال استنى، نعيد المحاولة لاحقاً
+            if name is None:
+                await asyncio.sleep(1)
                 continue
-            st["checked"] += 1
-            st["unknown"] += 1
-            st["streak"] += 1
-            if st["streak"] >= PAUSE_AFTER_FAILS:
-                st["pause_until"] = time.time() + PAUSE_SECONDS
-                st["streak"] = 0
-            continue
 
-        st["checked"] += 1
-        st["streak"] = 0
-        if res is not True:
-            continue
+            result = await check_psn(name)
 
-        # لقينا يوزر متاح: نأكده مرتين ونتأكد إن الفحص سليم قبل الإرسال
-        confirmed = True
-        for _ in range(2):
-            await asyncio.sleep(0.4)
-            if await conclusive(client, svc, name) is not True:
-                confirmed = False
+            if not sess.running:
                 break
-        healthy = await run_health(client, svc) if confirmed else None
-        if confirmed and healthy:
-            st["found"] += 1
-            await sess.queue.put((name, svc))
-        else:
-            st["rejected"] += 1
-            if confirmed and healthy is False:
-                st["ok"] = False
 
+            if result is None:
+                sess.stats["errors"] += 1
+                consecutive_errors += 1
 
-async def sender(sess, bot, chat_id):
-    while True:
-        first = await sess.queue.get()
-        items = [first]
-        await asyncio.sleep(0.2)
-        while not sess.queue.empty():
-            items.append(sess.queue.get_nowait())
-        grouped = {}
-        for n, s in items:
-            grouped.setdefault(n, []).append(s)
-        text = "\n".join(f"✅ {n} — {' ، '.join(ss)}" for n, ss in grouped.items())
+                if consecutive_errors >= MAX_ERRORS:
+                    await bot.send_message(
+                        chat_id,
+                        "⚠️ تعذر التحقق من PlayStation "
+                        "عدة مرات متتالية.\n"
+                        "أوقفت البحث مؤقتًا لتجنب "
+                        "إرسال نتائج غير موثوقة.\n\n"
+                        f"آخر خطأ: "
+                        f"{PSN_STATE['last_error']}"
+                    )
+
+                    await asyncio.sleep(60)
+                    consecutive_errors = 0
+
+                else:
+                    await asyncio.sleep(CHECK_INTERVAL)
+
+                continue
+
+            consecutive_errors = 0
+            sess.stats["checked"] += 1
+
+            if result is False:
+                sess.stats["existing"] += 1
+                await asyncio.sleep(CHECK_INTERVAL)
+                continue
+
+            sess.stats["not_found"] += 1
+
+            # لا نكرر إرسال الاسم دون إعادة التحقق.
+            await asyncio.sleep(1)
+
+            confirm = await check_psn(name)
+
+            if not sess.running:
+                break
+
+            if confirm is not True:
+                await asyncio.sleep(CHECK_INTERVAL)
+                continue
+
+            # تنبيه واضح: نتيجة البحث لا تثبت قابلية الحجز.
+            await bot.send_message(
+                chat_id,
+                "🔎 نتيجة بحث PlayStation\n\n"
+                f"الاسم: {name}\n"
+                "الحالة: لم يُعثر على الحساب في البحث.\n\n"
+                "⚠️ هذا لا يؤكد أن الاسم متاح "
+                "للتسجيل أو تغيير Online ID.\n"
+                "تحقق من الاسم عبر PlayStation "
+                "قبل الاعتماد عليه."
+            )
+
+            await asyncio.sleep(CHECK_INTERVAL)
+
+    except asyncio.CancelledError:
+        raise
+
+    except Exception as exc:
+        PSN_STATE["last_error"] = type(exc).__name__
+
         try:
-            await bot.send_message(chat_id, text)
+            await bot.send_message(
+                chat_id,
+                "❌ توقف البحث بسبب خطأ.\n"
+                f"النوع: {type(exc).__name__}"
+            )
         except Exception:
-            await asyncio.sleep(2)
-        await asyncio.sleep(0.4)
+            pass
+
+    finally:
+        sess.running = False
 
 
-async def run_session(sess, bot, chat_id):
-    limits = httpx.Limits(max_connections=100, max_keepalive_connections=40)
-    async with httpx.AsyncClient(timeout=6, follow_redirects=True, limits=limits) as client:
-        coros = [sender(sess, bot, chat_id)]
-        for svc, (_, workers) in SERVICES.items():
-            coros.append(health_loop(sess, svc, client))
-            for _ in range(workers):
-                coros.append(worker(sess, svc, client))
-        await asyncio.gather(*coros)
+# =========================================================
+# أوامر Telegram
+# =========================================================
 
-
-sessions = {}  # chat_id -> (Session, Task)
-
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def start(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
     chat_id = update.effective_chat.id
-    if chat_id in sessions and not sessions[chat_id][1].done():
-        await update.message.reply_text("البحث شغال أصلاً 🔍\n/status للتفاصيل\n/stop للإيقاف")
+
+    current = sessions.get(chat_id)
+
+    if current and current.running:
+        await update.effective_message.reply_text(
+            "🔍 البحث يعمل بالفعل.\n"
+            "/status — الإحصائيات\n"
+            "/stop — إيقاف البحث"
+        )
         return
+
+    if not NPSSO:
+        await update.effective_message.reply_text(
+            "❌ لم يتم ضبط NPSSO.\n"
+            "أضفه في Environment داخل Render."
+        )
+        return
+
     sess = Session()
-    task = asyncio.create_task(run_session(sess, context.bot, chat_id))
-    sessions[chat_id] = (sess, task)
-    await update.message.reply_text(
-        "بديت البحث في PlayStation 🔍\n"
-        "يوزرات من 4 و5 حروف فيها _ أو - في مكان واحد\n"
-        "الفحص من حسابك، وسوني تسمح بطلب كل 3 ثواني تقريباً (حوالي 20 فحص في الدقيقة).\n\n"
-        "ما أرسل لك يوزر إلا بعد ما أفحصه 3 مرات وأتأكد إن الفحص سليم.\n\n"
-        "/status لمعرفة حالة كل برنامج\n"
-        "/stop للإيقاف"
+
+    sess.task = asyncio.create_task(
+        search_loop(
+            sess,
+            context.bot,
+            chat_id,
+        )
+    )
+
+    sessions[chat_id] = sess
+
+    await update.effective_message.reply_text(
+        "🔍 بدأ البحث عن أسماء PlayStation.\n\n"
+        "• الأسماء: 4 أو 5 خانات.\n"
+        "• تحتوي على _ أو -.\n"
+        "• يتم استبعاد النتائج غير المؤكدة.\n\n"
+        "⚠️ البحث عن الحساب لا يثبت إمكانية حجز الاسم.\n\n"
+        "/status — الإحصائيات\n"
+        "/stop — إيقاف البحث\n"
+        "/test — اختبار الاتصال"
     )
 
 
-async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def stop(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
     chat_id = update.effective_chat.id
-    item = sessions.get(chat_id)
-    if item and not item[1].done():
-        item[1].cancel()
-        await update.message.reply_text("وقفت البحث ⏹")
-    else:
-        await update.message.reply_text("ما في بحث شغال.")
+    sess = sessions.get(chat_id)
 
-
-async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    item = sessions.get(chat_id)
-    if not item or item[1].done():
-        await update.message.reply_text("ما في بحث شغال. أرسل /start")
-        return
-    sess = item[0]
-    secs = max(time.time() - sess.started, 1)
-    now = time.time()
-    lines = [f"⏱ شغال من {secs / 60:.1f} دقيقة\n"]
-    for svc, st in sess.stats.items():
-        if st["ok"] is True:
-            state = "✅ سليم"
-        elif st["ok"] is False and PSN_STATE["auth_error"]:
-            state = f"⛔ مشكلة في كود الدخول NPSSO ({PSN_STATE['auth_error']})"
-        elif st["ok"] is False:
-            state = "⛔ الفحص غير موثوق"
-        else:
-            state = "… يختبر"
-        if RATE.get(svc, 0) > now:
-            state += " ⏳ البرنامج يطلب ننتظر"
-        elif st["pause_until"] > now:
-            state += " ⏸"
-        lines.append(
-            f"{svc}: {state}\n   فحص {st['checked']} ({st['checked'] / secs:.1f}/ثانية) | "
-            f"متاح {st['found']} | مرفوض {st['rejected']} | فشل {st['unknown']}"
+    if not sess or not sess.running:
+        await update.effective_message.reply_text(
+            "لا يوجد بحث يعمل حاليًا."
         )
-    await update.message.reply_text("\n".join(lines))
-
-
-async def test_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """يجرب الفحص من حسابك على يوزر موجود ويوزر عشوائي"""
-    if not NPSSO:
-        await update.message.reply_text("ما لقيت NPSSO في Render. ضيفه في Environment وارجع جرب.")
         return
-    await update.message.reply_text("أجرب الفحص... ممكن ياخذ ثواني ⏳")
-    lines = []
-    for name, expect in (("john", "موجود (المفروض غير متاح)"), (free_name(), "ما له صاحب (المفروض متاح)")):
-        res = await asyncio.to_thread(_psn_lookup, name)
-        out = {True: "✅ متاح", False: "❌ غير متاح", None: "⚠️ ما قدر يتحقق"}[res]
-        lines.append(f"{name}\nالمتوقع: {expect}\nالنتيجة: {out}")
-    if PSN_STATE["auth_error"]:
-        lines.append(f"مشكلة دخول: {PSN_STATE['auth_error']}")
-    elif PSN_STATE["last_error"]:
-        lines.append(f"آخر خطأ: {PSN_STATE['last_error']}")
-    await update.message.reply_text("\n\n".join(lines))
 
+    sess.running = False
+
+    if sess.task and not sess.task.done():
+        sess.task.cancel()
+
+    await update.effective_message.reply_text(
+        "⏹ تم طلب إيقاف البحث."
+    )
+
+
+async def status(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    chat_id = update.effective_chat.id
+    sess = sessions.get(chat_id)
+
+    if not sess:
+        await update.effective_message.reply_text(
+            "لا توجد جلسة بحث.\nأرسل /start"
+        )
+        return
+
+    elapsed = max(time.time() - sess.started, 1)
+
+    state = (
+        "🟢 يعمل"
+        if sess.running
+        else "⏹ متوقف"
+    )
+
+    stats = sess.stats
+
+    message = (
+        f"الحالة: {state}\n"
+        f"المدة: {elapsed / 60:.1f} دقيقة\n\n"
+        f"إجمالي الفحوصات: {stats['checked']}\n"
+        f"حسابات موجودة: {stats['existing']}\n"
+        f"لم يُعثر عليها: {stats['not_found']}\n"
+        f"أخطاء: {stats['errors']}\n\n"
+        f"آخر خطأ: {PSN_STATE['last_error']}\n"
+        f"مشكلة مصادقة: {PSN_STATE['auth_error']}"
+    )
+
+    await update.effective_message.reply_text(message)
+
+
+async def test_cmd(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    if not NPSSO:
+        await update.effective_message.reply_text(
+            "❌ NPSSO غير موجود في Environment."
+        )
+        return
+
+    await update.effective_message.reply_text(
+        "⏳ أختبر الاتصال مع PlayStation..."
+    )
+
+    result = await check_psn("john")
+
+    if result is False:
+        message = (
+            "✅ تم العثور على الحساب التجريبي.\n"
+            "الاتصال نجح لهذا الطلب."
+        )
+
+    elif result is True:
+        message = (
+            "⚠️ لم يُعثر على الحساب التجريبي.\n"
+            "لا يمكن اعتبار هذا الاختبار تأكيدًا "
+            "لصحة فحص توفر الأسماء."
+        )
+
+    else:
+        message = (
+            "❌ تعذر التحقق من الحساب.\n"
+            f"الخطأ: {PSN_STATE['last_error']}\n"
+            f"المصادقة: {PSN_STATE['auth_error']}"
+        )
+
+    await update.effective_message.reply_text(message)
+
+
+# =========================================================
+# خادم Render
+# =========================================================
 
 class Ping(BaseHTTPRequestHandler):
+
     def do_GET(self):
         self.send_response(200)
+        self.send_header(
+            "Content-Type",
+            "text/plain; charset=utf-8",
+        )
         self.end_headers()
         self.wfile.write(b"ok")
 
@@ -365,21 +463,59 @@ class Ping(BaseHTTPRequestHandler):
 
 
 def run_ping():
-    port = int(os.environ.get("PORT", 10000))
-    HTTPServer(("0.0.0.0", port), Ping).serve_forever()
+    port = int(os.environ.get("PORT", "10000"))
 
+    server = HTTPServer(
+        ("0.0.0.0", port),
+        Ping,
+    )
+
+    server.serve_forever()
+
+
+# =========================================================
+# تشغيل البوت
+# =========================================================
 
 async def main():
-    threading.Thread(target=run_ping, daemon=True).start()
-    app = Application.builder().token(TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("stop", stop))
-    app.add_handler(CommandHandler("status", status))
-    app.add_handler(CommandHandler("test", test_cmd))
+    threading.Thread(
+        target=run_ping,
+        daemon=True,
+    ).start()
+
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .build()
+    )
+
+    app.add_handler(
+        CommandHandler("start", start)
+    )
+
+    app.add_handler(
+        CommandHandler("stop", stop)
+    )
+
+    app.add_handler(
+        CommandHandler("status", status)
+    )
+
+    app.add_handler(
+        CommandHandler("test", test_cmd)
+    )
+
     await app.initialize()
     await app.start()
     await app.updater.start_polling()
-    await asyncio.Event().wait()
+
+    try:
+        await asyncio.Event().wait()
+
+    finally:
+        await app.updater.stop()
+        await app.stop()
+        await app.shutdown()
 
 
 if __name__ == "__main__":
