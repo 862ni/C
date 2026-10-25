@@ -32,71 +32,6 @@ RATE = {}
 # ---------------------------------------------------------------
 
 
-async def check_tiktok(client, name):
-    url = f"https://www.tiktok.com/@{name}"
-    try:
-        page, oembed = await asyncio.gather(
-            client.get(url, headers=HEADERS),
-            client.get("https://www.tiktok.com/oembed", params={"url": url}, headers=HEADERS),
-        )
-    except Exception:
-        return None
-
-    text = page.text if page.status_code == 200 else ""
-
-    # أي إشارة إن الحساب موجود = غير متاح
-    if oembed.status_code == 200 and "author" in oembed.text:
-        return False
-    if '"uniqueId"' in text or '"statusCode":0' in text:
-        return False
-
-    # متاح فقط لو الصفحة تقول "ما في مستخدم" والـ oembed ما لقاه
-    not_found = (
-        page.status_code == 404
-        or '"statusCode":10221' in text
-        or '"statusCode":10202' in text
-    )
-    if not_found and oembed.status_code != 200:
-        return True
-    return None
-
-
-async def check_instagram(client, name):
-    try:
-        page, api = await asyncio.gather(
-            client.get(f"https://www.instagram.com/{name}/", headers=HEADERS, follow_redirects=False),
-            client.get(
-                "https://i.instagram.com/api/v1/users/web_profile_info/",
-                params={"username": name},
-                headers={**HEADERS, "x-ig-app-id": "936619743392459"},
-                follow_redirects=False,
-            ),
-        )
-    except Exception:
-        return None
-
-    if api.status_code == 200 and '"user"' in api.text:
-        return False
-    if page.status_code == 200 and f"@{name}" in page.text.lower():
-        return False
-    if api.status_code == 404 and page.status_code in (404, 301, 302, 200):
-        # لو الصفحة 200 بدون اسم اليوزر، نعتبرها صفحة عامة (مو حساب)
-        return True
-    return None
-
-
-async def check_snapchat(client, name):
-    try:
-        page = await client.get(f"https://www.snapchat.com/add/{name}", headers=HEADERS)
-    except Exception:
-        return None
-    if page.status_code == 404:
-        return True
-    if page.status_code == 200 and name in page.text.lower():
-        return False
-    return None
-
-
 async def check_discord(client, name):
     try:
         r = await client.post(
@@ -143,21 +78,18 @@ async def check_psn(client, name):
 
 # اسم البرنامج: (دالة الفحص، عدد الفحوصات المتزامنة، تأخير صغير بين كل فحص)
 SERVICES = {
-    "TikTok": (check_tiktok, 8, 0.0),
-    "Instagram": (check_instagram, 5, 0.0),
-    "Snapchat": (check_snapchat, 10, 0.0),
     "Discord": (check_discord, 3, 0.25),
-    "PlayStation": (check_psn, 6, 0.0),
+    "PlayStation": (check_psn, 8, 0.0),
 }
 
 # يوزر معروف إنه محجوز في كل برنامج، نستخدمه نختبر فيه الفحص
 CANARY_TAKEN = {
-    "TikTok": "tiktok",
-    "Instagram": "instagram",
-    "Snapchat": "snapchat",
     "Discord": "discord",
     "PlayStation": "john",
 }
+
+# سوني ما تقبل يوزر يبدأ بـ _ أو - ، لو تبي تجربه غيّرها إلى True
+PSN_ALLOW_SYMBOL_FIRST = False
 
 PAUSE_AFTER_FAILS = 20
 PAUSE_SECONDS = 60
@@ -170,16 +102,28 @@ def free_name():
 
 
 def random_name(svc=None):
-    """يوزر من 3 أو 4 خانات، يبدأ بحرف وينتهي بحرف أو رقم"""
-    length = random.choice([3, 4])
-    first = random.choice(LETTERS)
-    last = random.choice(LETTERS + DIGITS)
-    alphabet = LETTERS + DIGITS + "_"
-    middle = [random.choice(alphabet) for _ in range(length - 2)]
-    if svc == "Discord" and length == 4 and random.random() < 0.4:
-        # ديسكورد يقبل النقطة، وفرصة المتاح فيها أعلى
-        middle[random.randrange(len(middle))] = "."
-    return first + "".join(middle) + last
+    """يوزر رباعي حسب شروط كل برنامج"""
+    if svc == "PlayStation":
+        # 4 خانات، فيها رمز واحد بس (_ أو -) في أي مكان، والباقي حروف وأرقام
+        positions = [0, 1, 2, 3] if PSN_ALLOW_SYMBOL_FIRST else [1, 2, 3]
+        pos = random.choice(positions)
+        symbol = random.choice("_-")
+        chars = []
+        for i in range(4):
+            if i == pos:
+                chars.append(symbol)
+            elif i == 0:
+                chars.append(random.choice(LETTERS))
+            else:
+                chars.append(random.choice(LETTERS + DIGITS))
+        return "".join(chars)
+
+    # ديسكورد: رباعي، يبدأ وينتهي بحرف أو رقم، وأحياناً نقطة أو _ في النص
+    alphabet = LETTERS + DIGITS
+    chars = [random.choice(alphabet) for _ in range(4)]
+    if random.random() < 0.4:
+        chars[random.choice([1, 2])] = random.choice("._")
+    return "".join(chars)
 
 
 async def run_health(client, svc):
@@ -312,8 +256,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     task = asyncio.create_task(run_session(sess, context.bot, chat_id))
     sessions[chat_id] = (sess, task)
     await update.message.reply_text(
-        "بديت البحث الصارم عن يوزرات من 3 و4 خانات 🔍\n"
-        "البرامج: " + "، ".join(SERVICES) + "\n\n"
+        "بديت البحث الصارم 🔍\n"
+        "• Discord: يوزرات رباعية\n"
+        "• PlayStation: رباعية فيها _ أو - في مكان واحد\n\n"
         "قبل ما أرسل أي يوزر:\n"
         "• أفحصه 3 مرات\n"
         "• أتأكد إن الفحص نفسه سليم (يعرف المحجوز من المتاح)\n\n"
