@@ -44,28 +44,6 @@ def _retry_after(r, default=3.0):
         return default
 
 
-async def check_discord(client, name):
-    try:
-        r = await client.post(
-            "https://discord.com/api/v9/unique-username/username-attempt-unauthed",
-            json={"username": name},
-            headers={"User-Agent": UA},
-        )
-    except Exception:
-        return None
-    if r.status_code == 429:
-        RATE["Discord"] = time.time() + _retry_after(r) + 0.2
-        return None
-    if r.status_code == 200:
-        try:
-            data = r.json()
-            if "taken" in data:
-                return not data["taken"]
-        except Exception:
-            return None
-    return None
-
-
 async def check_psn(client, name):
     try:
         r = await client.post(
@@ -87,13 +65,11 @@ async def check_psn(client, name):
 
 # اسم البرنامج: (دالة الفحص، عدد الفحوصات المتزامنة)
 SERVICES = {
-    "Discord": (check_discord, 6),
-    "PlayStation": (check_psn, 12),
+    "PlayStation": (check_psn, 20),
 }
 
 # يوزر معروف إنه محجوز، نستخدمه نختبر فيه الفحص
 CANARY_TAKEN = {
-    "Discord": "discord",
     "PlayStation": "john",
 }
 
@@ -108,26 +84,18 @@ def free_name():
 
 
 def random_name(svc=None):
-    """يوزر رباعي حسب شروط كل برنامج"""
-    if svc == "PlayStation":
-        positions = [0, 1, 2, 3] if PSN_ALLOW_SYMBOL_FIRST else [1, 2, 3]
-        pos = random.choice(positions)
-        symbol = random.choice("_-")
-        chars = []
-        for i in range(4):
-            if i == pos:
-                chars.append(symbol)
-            elif i == 0:
-                chars.append(random.choice(LETTERS))
-            else:
-                chars.append(random.choice(LETTERS + DIGITS))
-        return "".join(chars)
-
-    # ديسكورد: رباعي، أحياناً نقطة أو _ في النص
-    alphabet = LETTERS + DIGITS
-    chars = [random.choice(alphabet) for _ in range(4)]
-    if random.random() < 0.4:
-        chars[random.choice([1, 2])] = random.choice("._")
+    """4 خانات فيها رمز واحد (_ أو -) في أي مكان، والباقي حروف وأرقام"""
+    positions = [0, 1, 2, 3] if PSN_ALLOW_SYMBOL_FIRST else [1, 2, 3]
+    pos = random.choice(positions)
+    symbol = random.choice("_-")
+    chars = []
+    for i in range(4):
+        if i == pos:
+            chars.append(symbol)
+        elif i == 0:
+            chars.append(random.choice(LETTERS))
+        else:
+            chars.append(random.choice(LETTERS + DIGITS))
     return "".join(chars)
 
 
@@ -290,9 +258,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     task = asyncio.create_task(run_session(sess, context.bot, chat_id))
     sessions[chat_id] = (sess, task)
     await update.message.reply_text(
-        "بديت البحث السريع 🔍\n"
-        "• Discord: يوزرات رباعية\n"
-        "• PlayStation: رباعية فيها _ أو - في مكان واحد\n\n"
+        "بديت البحث السريع في PlayStation 🔍\n"
+        "يوزرات رباعية فيها _ أو - في مكان واحد\n\n"
         "ما أرسل لك يوزر إلا بعد ما أفحصه 3 مرات وأتأكد إن الفحص سليم.\n\n"
         "/status لمعرفة حالة كل برنامج\n"
         "/stop للإيقاف"
