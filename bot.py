@@ -304,6 +304,24 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines))
 
 
+async def test_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """يجرب طلب واحد على سوني ويطلع لك الرد الخام، عشان نعرف وش المشكلة"""
+    lines = []
+    async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
+        for name in ("john", free_name()):
+            try:
+                r = await client.post(
+                    "https://accounts.api.playstation.com/api/v1/accounts/onlineIds",
+                    json={"onlineId": name, "reserveIfAvailable": False},
+                    headers={"User-Agent": UA},
+                )
+                body = r.text.strip().replace("\n", " ")[:160]
+                lines.append(f"{name}\nالحالة: {r.status_code}\nالرد: {body}")
+            except Exception as e:
+                lines.append(f"{name}\nخطأ: {type(e).__name__}: {str(e)[:120]}")
+    await update.message.reply_text("\n\n".join(lines))
+
+
 class Ping(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -325,6 +343,7 @@ async def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("stop", stop))
     app.add_handler(CommandHandler("status", status))
+    app.add_handler(CommandHandler("test", test_cmd))
     await app.initialize()
     await app.start()
     await app.updater.start_polling()
