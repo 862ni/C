@@ -110,12 +110,13 @@ def free_name():
 
 
 def random_name(svc=None):
-    """4 خانات فيها رمز واحد (_ أو -) في أي مكان، والباقي حروف وأرقام"""
-    positions = [0, 1, 2, 3] if PSN_ALLOW_SYMBOL_FIRST else [1, 2, 3]
-    pos = random.choice(positions)
+    """4 أو 5 خانات فيها رمز واحد (_ أو -) في أي مكان، والباقي حروف وأرقام"""
+    length = random.choice([4, 5])
+    first_pos = 0 if PSN_ALLOW_SYMBOL_FIRST else 1
+    pos = random.randrange(first_pos, length)
     symbol = random.choice("_-")
     chars = []
-    for i in range(4):
+    for i in range(length):
         if i == pos:
             chars.append(symbol)
         elif i == 0:
@@ -287,7 +288,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sessions[chat_id] = (sess, task)
     await update.message.reply_text(
         "بديت البحث في PlayStation 🔍\n"
-        "يوزرات رباعية فيها _ أو - في مكان واحد\n"
+        "يوزرات من 4 و5 حروف فيها _ أو - في مكان واحد\n"
         "الفحص من حسابك، وسوني تسمح بطلب كل 3 ثواني تقريباً (حوالي 20 فحص في الدقيقة).\n\n"
         "ما أرسل لك يوزر إلا بعد ما أفحصه 3 مرات وأتأكد إن الفحص سليم.\n\n"
         "/status لمعرفة حالة كل برنامج\n"
