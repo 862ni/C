@@ -12,24 +12,36 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 
 TOKEN = os.environ["BOT_TOKEN"]
 
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
-        "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
-    ),
-    "Accept-Language": "en-US,en;q=0.9",
-}
+UA = (
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+    "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
+)
 
 LETTERS = string.ascii_lowercase
 DIGITS = string.digits
 
-# وقت انتهاء الحظر المؤقت لكل برنامج (يحدده ديسكورد لما يقول "استنى")
+# وقت انتهاء الانتظار لكل برنامج (لما البرنامج يقول "استنى شوي")
 RATE = {}
+
+# سوني ما تقبل يوزر يبدأ بـ _ أو - ، لو تبي تجربه غيّرها إلى True
+PSN_ALLOW_SYMBOL_FIRST = False
 
 # ---------------------------------------------------------------
 # كل دالة ترجع: True = متاح ، False = غير متاح ، None = ما قدرت أتحقق
-# الشرط صارم: ما نقول "متاح" إلا لو كل الإشارات تتفق
+# هذي نفس طلبات "فحص التوفر" اللي يستخدمها البرنامج وقت التسجيل،
+# فاليوزر المحظور أو المحجوز أو غير المقبول يطلع غير متاح.
 # ---------------------------------------------------------------
+
+
+def _retry_after(r, default=3.0):
+    try:
+        return float(r.json().get("retry_after", default))
+    except Exception:
+        pass
+    try:
+        return float(r.headers.get("Retry-After", default))
+    except Exception:
+        return default
 
 
 async def check_discord(client, name):
@@ -37,18 +49,12 @@ async def check_discord(client, name):
         r = await client.post(
             "https://discord.com/api/v9/unique-username/username-attempt-unauthed",
             json={"username": name},
-            headers={"User-Agent": HEADERS["User-Agent"]},
+            headers={"User-Agent": UA},
         )
     except Exception:
         return None
     if r.status_code == 429:
-        # ديسكورد يقول لنا كم ننتظر، نحترم الوقت ونكمل
-        wait = 5.0
-        try:
-            wait = float(r.json().get("retry_after", wait))
-        except Exception:
-            pass
-        RATE["Discord"] = time.time() + wait + 0.5
+        RATE["Discord"] = time.time() + _retry_after(r) + 0.2
         return None
     if r.status_code == 200:
         try:
@@ -65,9 +71,12 @@ async def check_psn(client, name):
         r = await client.post(
             "https://accounts.api.playstation.com/api/v1/accounts/onlineIds",
             json={"onlineId": name, "reserveIfAvailable": False},
-            headers={"User-Agent": HEADERS["User-Agent"]},
+            headers={"User-Agent": UA},
         )
     except Exception:
+        return None
+    if r.status_code == 429:
+        RATE["PlayStation"] = time.time() + _retry_after(r) + 0.2
         return None
     if r.status_code in (200, 201, 204):
         return True
@@ -76,27 +85,24 @@ async def check_psn(client, name):
     return None
 
 
-# اسم البرنامج: (دالة الفحص، عدد الفحوصات المتزامنة، تأخير صغير بين كل فحص)
+# اسم البرنامج: (دالة الفحص، عدد الفحوصات المتزامنة)
 SERVICES = {
-    "Discord": (check_discord, 3, 0.25),
-    "PlayStation": (check_psn, 8, 0.0),
+    "Discord": (check_discord, 6),
+    "PlayStation": (check_psn, 12),
 }
 
-# يوزر معروف إنه محجوز في كل برنامج، نستخدمه نختبر فيه الفحص
+# يوزر معروف إنه محجوز، نستخدمه نختبر فيه الفحص
 CANARY_TAKEN = {
     "Discord": "discord",
     "PlayStation": "john",
 }
 
-# سوني ما تقبل يوزر يبدأ بـ _ أو - ، لو تبي تجربه غيّرها إلى True
-PSN_ALLOW_SYMBOL_FIRST = False
-
-PAUSE_AFTER_FAILS = 20
-PAUSE_SECONDS = 60
+PAUSE_AFTER_FAILS = 30
+PAUSE_SECONDS = 30
 
 
 def free_name():
-    """يوزر طويل عشوائي، أكيد غير موجود. نستخدمه نتأكد إن الفحص يقول 'متاح' لما يكون متاح"""
+    """يوزر طويل عشوائي، أكيد غير موجود"""
     mid = "".join(random.choice(LETTERS) for _ in range(13))
     return random.choice(LETTERS) + mid + random.choice(LETTERS)
 
@@ -104,7 +110,6 @@ def free_name():
 def random_name(svc=None):
     """يوزر رباعي حسب شروط كل برنامج"""
     if svc == "PlayStation":
-        # 4 خانات، فيها رمز واحد بس (_ أو -) في أي مكان، والباقي حروف وأرقام
         positions = [0, 1, 2, 3] if PSN_ALLOW_SYMBOL_FIRST else [1, 2, 3]
         pos = random.choice(positions)
         symbol = random.choice("_-")
@@ -118,7 +123,7 @@ def random_name(svc=None):
                 chars.append(random.choice(LETTERS + DIGITS))
         return "".join(chars)
 
-    # ديسكورد: رباعي، يبدأ وينتهي بحرف أو رقم، وأحياناً نقطة أو _ في النص
+    # ديسكورد: رباعي، أحياناً نقطة أو _ في النص
     alphabet = LETTERS + DIGITS
     chars = [random.choice(alphabet) for _ in range(4)]
     if random.random() < 0.4:
@@ -126,11 +131,29 @@ def random_name(svc=None):
     return "".join(chars)
 
 
-async def run_health(client, svc):
-    """يتأكد إن الفحص سليم: المحجوز يطلع محجوز، والحر يطلع حر"""
+async def conclusive(client, svc, name, tries=6):
+    """يكرر الفحص لين يجي جواب واضح (ينتظر لو البرنامج قال استنى)"""
     checker = SERVICES[svc][0]
-    taken_res = await checker(client, CANARY_TAKEN[svc])
-    free_res = await checker(client, free_name())
+    for _ in range(tries):
+        wait = RATE.get(svc, 0) - time.time()
+        if wait > 0:
+            await asyncio.sleep(wait)
+        res = await checker(client, name)
+        if res is not None:
+            return res
+        await asyncio.sleep(0.3)
+    return None
+
+
+async def run_health(client, svc):
+    """
+    يتأكد إن الفحص سليم: المحجوز يطلع محجوز، والحر يطلع حر.
+    True = سليم ، False = غلط أكيد ، None = ما قدر يتأكد (حظر مؤقت مثلاً)
+    """
+    taken_res = await conclusive(client, svc, CANARY_TAKEN[svc], tries=3)
+    free_res = await conclusive(client, svc, free_name(), tries=3)
+    if taken_res is None or free_res is None:
+        return None
     return taken_res is False and free_res is True
 
 
@@ -162,21 +185,27 @@ class Session:
 async def health_loop(sess, svc, client):
     st = sess.stats[svc]
     while True:
-        if RATE.get(svc, 0) > time.time():
-            await asyncio.sleep(1)
-            continue
         ok = await run_health(client, svc)
-        st["ok"] = ok
-        await asyncio.sleep(60 if ok else 20)
+        if ok is not None:          # لو ما قدر يتأكد نخلي الحالة السابقة
+            st["ok"] = ok
+        await asyncio.sleep(120 if st["ok"] else 30)
 
 
 async def worker(sess, svc, client):
-    checker, _, delay = SERVICES[svc]
+    checker, _ = SERVICES[svc]
     st = sess.stats[svc]
     while True:
         now = time.time()
-        if st["ok"] is not True or st["pause_until"] > now or RATE.get(svc, 0) > now:
-            await asyncio.sleep(0.5)
+        if st["pause_until"] > now:
+            await asyncio.sleep(min(2, st["pause_until"] - now))
+            continue
+        wait = RATE.get(svc, 0) - now
+        if wait > 0:
+            await asyncio.sleep(min(2, wait))
+            continue
+        if st["ok"] is False:
+            # الفحص غير سليم، نرتاح ونتأكد كل شوي من health_loop
+            await asyncio.sleep(1)
             continue
 
         name = sess.next_name(svc)
@@ -185,41 +214,46 @@ async def worker(sess, svc, client):
             continue
 
         res = await checker(client, name)
-        st["checked"] += 1
 
         if res is None:
+            if RATE.get(svc, 0) > time.time():
+                sess.seen[svc].discard(name)   # البرنامج قال استنى، نعيد المحاولة لاحقاً
+                continue
+            st["checked"] += 1
             st["unknown"] += 1
             st["streak"] += 1
             if st["streak"] >= PAUSE_AFTER_FAILS:
                 st["pause_until"] = time.time() + PAUSE_SECONDS
                 st["streak"] = 0
-        else:
-            st["streak"] = 0
-            if res is True:
-                # تأكيد مرتين إضافيتين، ثم نتأكد إن الفحص نفسه سليم لحظة الإرسال
-                confirmed = True
-                for _ in range(2):
-                    await asyncio.sleep(0.7)
-                    if await checker(client, name) is not True:
-                        confirmed = False
-                        break
-                if confirmed and await run_health(client, svc):
-                    st["found"] += 1
-                    await sess.queue.put((name, svc))
-                else:
-                    st["rejected"] += 1
-                    if confirmed:
-                        st["ok"] = False  # الفحص صار يعطي نتائج مشكوك فيها
+            continue
 
-        if delay:
-            await asyncio.sleep(delay)
+        st["checked"] += 1
+        st["streak"] = 0
+        if res is not True:
+            continue
+
+        # لقينا يوزر متاح: نأكده مرتين ونتأكد إن الفحص سليم قبل الإرسال
+        confirmed = True
+        for _ in range(2):
+            await asyncio.sleep(0.4)
+            if await conclusive(client, svc, name) is not True:
+                confirmed = False
+                break
+        healthy = await run_health(client, svc) if confirmed else None
+        if confirmed and healthy:
+            st["found"] += 1
+            await sess.queue.put((name, svc))
+        else:
+            st["rejected"] += 1
+            if confirmed and healthy is False:
+                st["ok"] = False
 
 
 async def sender(sess, bot, chat_id):
     while True:
         first = await sess.queue.get()
         items = [first]
-        await asyncio.sleep(0.3)
+        await asyncio.sleep(0.2)
         while not sess.queue.empty():
             items.append(sess.queue.get_nowait())
         grouped = {}
@@ -230,14 +264,14 @@ async def sender(sess, bot, chat_id):
             await bot.send_message(chat_id, text)
         except Exception:
             await asyncio.sleep(2)
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(0.4)
 
 
 async def run_session(sess, bot, chat_id):
     limits = httpx.Limits(max_connections=100, max_keepalive_connections=40)
-    async with httpx.AsyncClient(timeout=8, follow_redirects=True, limits=limits) as client:
+    async with httpx.AsyncClient(timeout=6, follow_redirects=True, limits=limits) as client:
         coros = [sender(sess, bot, chat_id)]
-        for svc, (_, workers, _) in SERVICES.items():
+        for svc, (_, workers) in SERVICES.items():
             coros.append(health_loop(sess, svc, client))
             for _ in range(workers):
                 coros.append(worker(sess, svc, client))
@@ -256,12 +290,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     task = asyncio.create_task(run_session(sess, context.bot, chat_id))
     sessions[chat_id] = (sess, task)
     await update.message.reply_text(
-        "بديت البحث الصارم 🔍\n"
+        "بديت البحث السريع 🔍\n"
         "• Discord: يوزرات رباعية\n"
         "• PlayStation: رباعية فيها _ أو - في مكان واحد\n\n"
-        "قبل ما أرسل أي يوزر:\n"
-        "• أفحصه 3 مرات\n"
-        "• أتأكد إن الفحص نفسه سليم (يعرف المحجوز من المتاح)\n\n"
+        "ما أرسل لك يوزر إلا بعد ما أفحصه 3 مرات وأتأكد إن الفحص سليم.\n\n"
         "/status لمعرفة حالة كل برنامج\n"
         "/stop للإيقاف"
     )
@@ -284,25 +316,24 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("ما في بحث شغال. أرسل /start")
         return
     sess = item[0]
-    mins = max((time.time() - sess.started) / 60, 0.01)
+    secs = max(time.time() - sess.started, 1)
     now = time.time()
-    lines = [f"⏱ شغال من {mins:.1f} دقيقة\n"]
-    total = 0
+    lines = [f"⏱ شغال من {secs / 60:.1f} دقيقة\n"]
     for svc, st in sess.stats.items():
-        total += st["checked"]
         if st["ok"] is True:
             state = "✅ سليم"
         elif st["ok"] is False:
             state = "⛔ الفحص غير موثوق (غالباً محظور)"
         else:
             state = "… يختبر"
-        if st["pause_until"] > now or RATE.get(svc, 0) > now:
+        if RATE.get(svc, 0) > now:
+            state += " ⏳ البرنامج يطلب ننتظر"
+        elif st["pause_until"] > now:
             state += " ⏸"
         lines.append(
-            f"{svc}: {state}\n   فحص {st['checked']} | متاح {st['found']} | "
-            f"مرفوض بعد التأكيد {st['rejected']} | فشل {st['unknown']}"
+            f"{svc}: {state}\n   فحص {st['checked']} ({st['checked'] / secs:.1f}/ثانية) | "
+            f"متاح {st['found']} | مرفوض {st['rejected']} | فشل {st['unknown']}"
         )
-    lines.append(f"\nالسرعة: {total / (mins * 60):.1f} فحص/ثانية")
     await update.message.reply_text("\n".join(lines))
 
 
