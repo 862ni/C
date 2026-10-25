@@ -44,28 +44,54 @@ def _retry_after(r, default=3.0):
         return default
 
 
+NPSSO = os.environ.get("NPSSO", "").strip()
+_psn = None
+_psn_lock = threading.Lock()
+PSN_STATE = {"auth_error": None, "last_error": None}
+
+
+def _get_psn():
+    global _psn
+    if _psn is None:
+        from psnawp_api import PSNAWP
+        _psn = PSNAWP(NPSSO)
+    return _psn
+
+
+def _psn_lookup(name):
+    """يدور على اليوزر من حسابك. True = ما له صاحب (متاح) ، False = موجود ، None = ما قدر"""
+    if not NPSSO:
+        PSN_STATE["auth_error"] = "NPSSO ما انحط في Render"
+        return None
+    with _psn_lock:
+        try:
+            psn = _get_psn()
+        except Exception as e:
+            PSN_STATE["auth_error"] = type(e).__name__
+            return None
+        try:
+            psn.user(online_id=name)
+            PSN_STATE["auth_error"] = None
+            return False
+        except Exception as e:
+            kind = type(e).__name__
+            if "NotFound" in kind:
+                PSN_STATE["auth_error"] = None
+                return True
+            if "Authentication" in kind or "Unauthorized" in kind:
+                PSN_STATE["auth_error"] = kind
+            PSN_STATE["last_error"] = kind
+            return None
+
+
 async def check_psn(client, name):
-    try:
-        r = await client.post(
-            "https://accounts.api.playstation.com/api/v1/accounts/onlineIds",
-            json={"onlineId": name, "reserveIfAvailable": False},
-            headers={"User-Agent": UA},
-        )
-    except Exception:
-        return None
-    if r.status_code == 429:
-        RATE["PlayStation"] = time.time() + _retry_after(r) + 0.2
-        return None
-    if r.status_code in (200, 201, 204):
-        return True
-    if r.status_code == 400:
-        return False
-    return None
+    # مكتبة سوني بطيئة وتنتظر بين كل طلب (طلب كل 3 ثواني)، فنشغلها في خيط جانبي
+    return await asyncio.to_thread(_psn_lookup, name)
 
 
 # اسم البرنامج: (دالة الفحص، عدد الفحوصات المتزامنة)
 SERVICES = {
-    "PlayStation": (check_psn, 20),
+    "PlayStation": (check_psn, 3),
 }
 
 # يوزر معروف إنه محجوز، نستخدمه نختبر فيه الفحص
@@ -119,6 +145,8 @@ async def run_health(client, svc):
     True = سليم ، False = غلط أكيد ، None = ما قدر يتأكد (حظر مؤقت مثلاً)
     """
     taken_res = await conclusive(client, svc, CANARY_TAKEN[svc], tries=3)
+    if PSN_STATE["auth_error"]:
+        return False
     free_res = await conclusive(client, svc, free_name(), tries=3)
     if taken_res is None or free_res is None:
         return None
@@ -156,7 +184,7 @@ async def health_loop(sess, svc, client):
         ok = await run_health(client, svc)
         if ok is not None:          # لو ما قدر يتأكد نخلي الحالة السابقة
             st["ok"] = ok
-        await asyncio.sleep(120 if st["ok"] else 30)
+        await asyncio.sleep(300 if st["ok"] else 60)
 
 
 async def worker(sess, svc, client):
@@ -258,8 +286,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     task = asyncio.create_task(run_session(sess, context.bot, chat_id))
     sessions[chat_id] = (sess, task)
     await update.message.reply_text(
-        "بديت البحث السريع في PlayStation 🔍\n"
-        "يوزرات رباعية فيها _ أو - في مكان واحد\n\n"
+        "بديت البحث في PlayStation 🔍\n"
+        "يوزرات رباعية فيها _ أو - في مكان واحد\n"
+        "الفحص من حسابك، وسوني تسمح بطلب كل 3 ثواني تقريباً (حوالي 20 فحص في الدقيقة).\n\n"
         "ما أرسل لك يوزر إلا بعد ما أفحصه 3 مرات وأتأكد إن الفحص سليم.\n\n"
         "/status لمعرفة حالة كل برنامج\n"
         "/stop للإيقاف"
@@ -289,8 +318,10 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for svc, st in sess.stats.items():
         if st["ok"] is True:
             state = "✅ سليم"
+        elif st["ok"] is False and PSN_STATE["auth_error"]:
+            state = f"⛔ مشكلة في كود الدخول NPSSO ({PSN_STATE['auth_error']})"
         elif st["ok"] is False:
-            state = "⛔ الفحص غير موثوق (غالباً محظور)"
+            state = "⛔ الفحص غير موثوق"
         else:
             state = "… يختبر"
         if RATE.get(svc, 0) > now:
@@ -305,20 +336,20 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def test_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """يجرب طلب واحد على سوني ويطلع لك الرد الخام، عشان نعرف وش المشكلة"""
+    """يجرب الفحص من حسابك على يوزر موجود ويوزر عشوائي"""
+    if not NPSSO:
+        await update.message.reply_text("ما لقيت NPSSO في Render. ضيفه في Environment وارجع جرب.")
+        return
+    await update.message.reply_text("أجرب الفحص... ممكن ياخذ ثواني ⏳")
     lines = []
-    async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
-        for name in ("john", free_name()):
-            try:
-                r = await client.post(
-                    "https://accounts.api.playstation.com/api/v1/accounts/onlineIds",
-                    json={"onlineId": name, "reserveIfAvailable": False},
-                    headers={"User-Agent": UA},
-                )
-                body = r.text.strip().replace("\n", " ")[:160]
-                lines.append(f"{name}\nالحالة: {r.status_code}\nالرد: {body}")
-            except Exception as e:
-                lines.append(f"{name}\nخطأ: {type(e).__name__}: {str(e)[:120]}")
+    for name, expect in (("john", "موجود (المفروض غير متاح)"), (free_name(), "ما له صاحب (المفروض متاح)")):
+        res = await asyncio.to_thread(_psn_lookup, name)
+        out = {True: "✅ متاح", False: "❌ غير متاح", None: "⚠️ ما قدر يتحقق"}[res]
+        lines.append(f"{name}\nالمتوقع: {expect}\nالنتيجة: {out}")
+    if PSN_STATE["auth_error"]:
+        lines.append(f"مشكلة دخول: {PSN_STATE['auth_error']}")
+    elif PSN_STATE["last_error"]:
+        lines.append(f"آخر خطأ: {PSN_STATE['last_error']}")
     await update.message.reply_text("\n\n".join(lines))
 
 
